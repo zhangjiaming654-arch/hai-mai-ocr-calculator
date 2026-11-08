@@ -13,10 +13,12 @@
 import ctypes
 import itertools
 import random
+import queue
 import json
 import os
 import re
 import subprocess
+import threading
 import sys
 import time
 import tkinter as tk
@@ -496,6 +498,7 @@ class App:
         self.root = root
         self.cfg = cfg
         self.rows = []          # [[控制单价, OCR原文], ...]
+        self._busy = False
         self.jitter = 0.0
 
         root.title('取数计算器')
@@ -552,7 +555,7 @@ class App:
         self.var_rand = tk.BooleanVar(value=bool(cfg.get('rand_mode')))
         self.chk_rand = tk.Checkbutton(
             randbar, variable=self.var_rand, command=self._on_rand,
-            text='随机 ±%g%%（输出对应的下浮率在设定值附近浮动）' % RAND_BAND)
+            text='随机数')
         self.chk_rand.pack(side='left')
         self.entry.bind('<Return>', lambda e: self.recompute())
         self.entry.bind('<FocusOut>', lambda e: self.recompute())
@@ -678,28 +681,77 @@ class App:
 
     # -------------------------------------------------- 识别
     def recognize(self):
+        """点【识别】：主线程抓屏（几十毫秒）→ 后台线程跑 OCR → 主线程轮询取结果。
+
+        以前 OCR 卡在界面线程里：第一次要一秒多、偶发更久，看起来就像"窗口卡住了"。
+        """
+        if getattr(self, '_busy', False):
+            return
+        self._busy = True
+        self._queue = queue.Queue()
         self.btn.config(state='disabled', text='识别中')
         self.root.update_idletasks()
         try:
             image = self._grab()
-            nums = self._read_numbers(image)
-            if self._mode() == MODES[1]:
-                # 调价：控制价 + 单价下浮（下浮可能是负数，必须留着）
-                rows = [nums] if len(nums) >= 2 and nums[0] > 1.0 else []
-            else:
-                rows = [[v] for v in nums if v > 1.0]
-            if not rows:
-                messagebox.showinfo('没认出数字',
-                                    '框里没识别到数字。\n请把框对准数字那一列，窗口拉大一点再试。')
-                return
-            self.rows = rows
-            self._roll_jitter()
-            self.recompute()
-            self._redraw_frame()
         except Exception as exc:                      # noqa: BLE001
-            messagebox.showerror('识别失败', str(exc))
-        finally:
+            self._finish_busy()
+            self._show_hint('抓屏失败：%s' % exc)
+            return
+        want = self._want_count()                  # Tk 变量只能在主线程读
+        threading.Thread(target=self._recognize_worker, args=(image, want), daemon=True).start()
+        self.root.after(30, self._poll_result)
+
+    def _recognize_worker(self, image, want):
+        """后台线程：只做 OCR，把结果塞进队列（不碰任何 Tk 对象）。"""
+        nums, err = [], None
+        try:
+            nums = self._read_numbers(image, want)
+        except Exception as exc:                      # noqa: BLE001
+            err = exc
+        self._queue.put((nums, err))
+
+    def _poll_result(self):
+        """主线程：每 30ms 看一眼后台算完没有。"""
+        try:
+            nums, err = self._queue.get_nowait()
+        except queue.Empty:
+            if getattr(self, '_busy', False):
+                self.root.after(30, self._poll_result)
+            return
+        self._recognize_done(nums, err)
+
+    def _recognize_done(self, nums, err):
+        """回到界面线程：整理成行、摇随机数、显示。"""
+        self._finish_busy()
+        if err is not None:
+            self._show_hint('识别失败：%s' % err)
+            return
+        if self._mode() == MODES[1]:
+            rows = [nums] if len(nums) >= 2 and nums[0] > 1.0 else []
+        else:
+            rows = [[v] for v in nums if v > 1.0]
+        if not rows:
+            self._show_hint('没认出数字\n把框对准数字那一列，或把窗口拉大一点再试')
+            return
+        self.rows = rows
+        self._roll_jitter()
+        self.recompute()
+        self._redraw_frame()
+
+    def _finish_busy(self):
+        self._busy = False
+        try:
             self.btn.config(state='normal', text='识别')
+        except Exception:                             # noqa: BLE001
+            pass
+
+    def _show_hint(self, text):
+        """在输出框里提示（不弹模态框，免得看起来像卡死）。"""
+        try:
+            self.txt.delete('1.0', 'end')
+            self.txt.insert('1.0', text)
+        except Exception:                             # noqa: BLE001
+            pass
 
     def _grab(self):
         """抓取景框那一块屏幕。
@@ -731,13 +783,14 @@ class App:
         """这个模式下框里应该有几个数：主材单价 1 个，调价 2 个（用户明确说的）。"""
         return 2 if self._mode() == MODES[1] else 1
 
-    def _read_numbers(self, image):
+    def _read_numbers(self, image, want=None):
         """识别框里的数字，用"这个模式应该有几个数"当校验挑最靠谱的一次识别。
 
         依次换几组预处理（二值化阈值 120/140/160/100 + 原图），哪一组认出来的
         个数正好等于期望值就直接用；都不对就取最接近的，再按位置/形态兜底修整。
         """
-        want = self._want_count()
+        if want is None:                           # 主线程传进来，避免后台线程读 Tk 变量
+            want = self._want_count()
         best = []
         best_gap = None
         for prep, th in PREP_VARIANTS:
