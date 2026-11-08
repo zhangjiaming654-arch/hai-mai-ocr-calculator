@@ -1,0 +1,9 @@
+# 本机配置（含个人费率/窗口位置）
+config.json
+# Python
+__pycache__/
+*.py[cod]
+# 日志/临时
+*.log
+hm_grab.png
+hm_grab.json
