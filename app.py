@@ -54,6 +54,7 @@ DEFAULT_CFG = {
     "upscale": 6,
     "mode": "主材单价",
     "rand_mode": False,
+    "decimals": True,
 }
 
 # 随机模式：输出结果对应的下浮率在"设定下浮率 ± 这个值"内浮动（百分点）
@@ -557,6 +558,11 @@ class App:
             randbar, variable=self.var_rand, command=self._on_rand,
             text='随机数')
         self.chk_rand.pack(side='left')
+        self.var_dec = tk.BooleanVar(value=bool(cfg.get('decimals', True)))
+        self.chk_dec = tk.Checkbutton(
+            randbar, variable=self.var_dec, command=self._on_dec,
+            text='小数')
+        self.chk_dec.pack(side='left', padx=(16, 0))
         self.entry.bind('<Return>', lambda e: self.recompute())
         self.entry.bind('<FocusOut>', lambda e: self.recompute())
 
@@ -834,9 +840,26 @@ class App:
     def _on_rand(self):
         """点开关：记住设置，重新摇一个偏移，再算一遍。"""
         self.cfg['rand_mode'] = self._rand_on()
+        self.cfg['decimals'] = self._dec_on()
         save_cfg(self.cfg)
         self._roll_jitter()
         self.recompute()
+
+    def _dec_on(self):
+        """「小数」勾选框：勾上按小数输出，取消则输出整数。"""
+        return bool(getattr(self, 'var_dec', None) and self.var_dec.get())
+
+    def _on_dec(self):
+        """切换小数显示：记住设置再算一遍。"""
+        self.cfg['decimals'] = self._dec_on()
+        save_cfg(self.cfg)
+        self.recompute()
+
+    def _dec_places(self):
+        """输出保留几位小数：取消勾选 -> 0 位；调价+随机 -> 3 位；其余 2 位。"""
+        if not self._dec_on():
+            return 0
+        return 3 if (self._mode() == MODES[1] and self._rand_on()) else 2
 
     def _roll_jitter(self):
         """每识别一次摇一个偏移（百分点），随机模式关掉时是 0。"""
@@ -856,7 +879,7 @@ class App:
         if self._mode() == MODES[1]:               # 调价：输出该填的系数
             # 2 位小数时，系数动 0.01 对应下浮率跳 (1+当前下浮) 个百分点（常是 0.6~0.9），
             # 根本落不进 ±0.25 的带宽，所以随机模式下给 3 位小数。
-            dec = 3 if self._rand_on() else 2
+            dec = self._dec_places()
             for row in self.rows:
                 coef = price_factor(row[0], row[1], eff)
                 pairs.append(('—' if coef is None else _fmt(coef, dec), row))
@@ -865,7 +888,8 @@ class App:
             for row in self.rows:
                 for control in row:
                     if control > 1.0:
-                        pairs.append((_fmt(control * (1 + eff / 100.0) / k, 2), row))
+                        dec = self._dec_places()
+                        pairs.append((_fmt(control * (1 + eff / 100.0) / k, dec), row))
         return pairs
 
     def _implied_down(self, text, row):
@@ -884,6 +908,16 @@ class App:
             return None
         return (value * k_factor(self.cfg) / control - 1) * 100.0
 
+    def _max_dev(self, pairs, down):
+        """这一组显示值里，反算下浮率离目标最远偏差多少（百分点）。"""
+        worst = 0.0
+        for text, row in pairs:
+            implied = self._implied_down(text, row)
+            if implied is None:
+                return float('inf')
+            worst = max(worst, abs(implied - down))
+        return worst
+
     def recompute(self):
         """显示算出来的数（每行一个数）；随机模式下把结果的下浮率圈在 ±0.25 内。"""
         down = self._down_rate()
@@ -896,18 +930,16 @@ class App:
             self.jitter = 0.0
         pairs = self._render(down + getattr(self, 'jitter', 0.0))
         if self._rand_on():
-            # 小数位截断可能把结果推出带宽，重摇几次挑一个落在带内的
+            # 小数位截断可能把结果推出带宽，重摇几次挑偏差最小的
+            best_dev = self._max_dev(pairs, down)
             for _ in range(40):
-                bad = False
-                for text, row in pairs:
-                    implied = self._implied_down(text, row)
-                    if implied is None or abs(implied - down) > RAND_BAND + 1e-9:
-                        bad = True
-                        break
-                if not bad:
+                if best_dev <= RAND_BAND + 1e-9:
                     break
                 self.jitter = random.uniform(-RAND_BAND, RAND_BAND)
-                pairs = self._render(down + self.jitter)
+                cand = self._render(down + self.jitter)
+                dev = self._max_dev(cand, down)
+                if dev < best_dev:
+                    pairs, best_dev = cand, dev
         lines = [text for text, _row in pairs]
         self.txt.delete('1.0', 'end')
         self.txt.insert('1.0', '\n'.join(lines))
