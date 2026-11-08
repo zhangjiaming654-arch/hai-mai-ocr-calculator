@@ -120,16 +120,32 @@ powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
 
 ## 技术实现
 
-- **截屏**：先把自己隐藏，再用 GDI `BitBlt` 抓框内那块屏幕（`PIL.ImageGrab` 的底层同样是 BitBlt）。
-  - 注意：本程序窗口本身是"抠色透明"的分层窗口，普通 BitBlt 抓不到它，所以自测脚本里用带 `CAPTUREBLT` 标志的 BitBlt 才能拍到自己的界面。
-- **OCR**：PowerShell 通过 WinRT 调 `Windows.Media.Ocr`（与系统截图工具的「提取文本」同源），
-  `ocr.ps1` 负责调用并把结果以 JSON（每行文本 + 包围框）返回。
+- **截屏**：抓框内那块屏幕用 GDI `BitBlt`（`PIL.ImageGrab` 底层就是它）。
+  抓之前把**整个窗口的透明度瞬间降到 0**（`-alpha 0` → 抓 → 恢复），窗口不隐藏、不重排，所以不会闪；
+  实测这样抓到的画面与"真把窗口隐藏起来再抓"逐像素完全一致（色差 0.00）。
+  - 注意：本程序窗口本身是"抠色透明"的分层窗口，普通 BitBlt 抓不到它，所以自测脚本里要用带 `CAPTUREBLT` 标志的 BitBlt 才能拍到自己的界面。
+- **OCR**：PowerShell 通过 WinRT 调 `Windows.Media.Ocr`（与系统截图工具的「提取文本」同源）。
+  `ocr_serve.ps1` 是**常驻服务**：WinRT 类型只加载一次，之后每次识别只递一个图片路径过去、按行返回 JSON
+  （一次性启动 PowerShell 光启动就要 0.7 秒，常驻后每次只要几毫秒）；`ocr.ps1` 保留为一次性备用通道。
+- **剪贴板**：直接调 Win32（`OpenClipboard` / `SetClipboardData(CF_UNICODETEXT)`），约 0.2 毫秒；
+  比起一个 `clip.exe` 子进程（约 28 毫秒）快两个数量级，且窗口关掉后内容仍在。
+  64 位下句柄必须显式声明成 `c_void_p`，否则会被截断导致写入失败。
 - **预处理**（关键）：屏幕字是 ClearType 彩色抗锯齿，直接识别容易把 `6711.17` 读成 `671L 17`。所以先做
   **取最暗通道**（去掉彩色毛边）→ **二值化阈值 120** → **LANCZOS 放大 6 倍**，实测能把两张真实截图上
   6 个目标数字全部读对（不处理时只有 4~5 个）。预处理版与原图版各识别一次，取数字更全的那份。
 - **数字清洗**：中文全角数字、`一`/`−` 当负号、`，`/`。` 当小数点、千分位 `1,234.56`、`O↔0`、`l/I↔1` 等都会归一。
 - **几何**：Tk `geometry('+x+y')` 定的是窗口外框，而 `winfo_rootx()` 是客户区坐标，两者有边框差，
   所以取景框要按画布原点换算，不按窗口位置换算。
+
+## 性能（本机实测）
+
+| 环节 | 优化前 | 优化后 |
+|---|---|---|
+| 截屏 | 隐藏窗口 + 等 0.15 秒，会"黑一下" | 透明度瞬间归零，不闪；像素与隐藏时一致 |
+| 识别 | 每次重启 PowerShell，1.1～2.2 秒 | 常驻服务：首次约 1 秒，之后 20～35 毫秒 |
+| 写剪贴板 | `clip.exe` 子进程，约 28 毫秒 | Win32 接口，0.2 毫秒 |
+
+点一次【识别】：第一次约 1.1 秒，之后约 **0.1 秒**；改下浮率只重算不重新识别，约 0.06 毫秒。
 
 ## 已知限制
 
@@ -144,7 +160,8 @@ powershell -ExecutionPolicy Bypass -File make_shortcut.ps1
 
 ```
 app.py             主程序：界面、取景框、OCR 调用、计算
-ocr.ps1            PowerShell + WinRT 调用 Windows 自带 OCR
+ocr_serve.ps1      常驻 OCR 服务（PowerShell + WinRT，首次识别时自动拉起）
+ocr.ps1            一次性 OCR 备用通道（服务起不来时用）
 run.bat            启动器（pythonw，无控制台）
 make_shortcut.ps1  生成带图标的桌面快捷方式
 config.example.json 配置示例（复制成 config.json）

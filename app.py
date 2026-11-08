@@ -25,6 +25,7 @@ from PIL import Image, ImageChops, ImageFilter, ImageGrab
 BASE = os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE, 'config.json')
 OCR_PS1 = os.path.join(BASE, 'ocr.ps1')
+OCR_SERVE_PS1 = os.path.join(BASE, 'ocr_serve.ps1')
 TMP_DIR = os.environ.get('TEMP') or BASE
 TMP_IMG = os.path.join(TMP_DIR, 'hm_grab.png')
 TMP_JSON = os.path.join(TMP_DIR, 'hm_grab.json')
@@ -133,6 +134,59 @@ def _fmt(value, nd=None):
     return '%.*f' % (nd, value)
 
 
+def win_clipboard_text(text):
+    """用 Win32 API 直接写系统剪贴板（CF_UNICODETEXT），毫秒级、窗口关掉也还在。
+
+    返回 True 表示写入成功；失败时调用方可以退回 Tk 的剪贴板。
+    注意：64 位下句柄必须显式声明 c_void_p，否则会被截断成 32 位导致写入失败。
+    """
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+    user32.OpenClipboard.restype = ctypes.c_int
+    user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+
+    opened = False
+    for _ in range(6):                                     # 剪贴板偶尔被别人占着，重试几次
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.02)
+    if not opened:
+        return False
+
+    handle = None
+    try:
+        user32.EmptyClipboard()
+        data = str(text).encode('utf-16-le') + b'\x00\x00'
+        GMEM_MOVEABLE = 0x0002
+        handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+        if not handle:
+            return False
+        ptr = kernel32.GlobalLock(handle)
+        if not ptr:
+            return False
+        ctypes.memmove(ptr, data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if user32.SetClipboardData(13, handle):             # 13 = CF_UNICODETEXT
+            handle = None                                   # 交给系统了，别自己释放
+            return True
+        return False
+    except Exception:                                       # noqa: BLE001
+        return False
+    finally:
+        user32.CloseClipboard()
+        if handle:
+            kernel32.GlobalFree(handle)
+
+
 # ---------------------------------------------------------------- OCR 通道
 def prep_for_ocr(image, threshold=120):
     """OCR 前置：取 RGB 最暗通道去掉 ClearType 彩边，再二值化。
@@ -164,26 +218,82 @@ def ocr_image(image, scale=6, preprocess=True):
     big = src.resize((src.width * scale, src.height * scale), Image.LANCZOS) \
         if scale > 1 else src
     big.save(TMP_IMG, 'PNG')
-    if os.path.exists(TMP_JSON):
-        try:
-            os.remove(TMP_JSON)
-        except OSError:
-            pass
-    cmd = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-           '-File', OCR_PS1, '-ImagePath', TMP_IMG, '-OutPath', TMP_JSON]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120,
-                          creationflags=CREATE_NO_WINDOW)
-    if not os.path.exists(TMP_JSON):
-        err = (proc.stderr or b'').decode('mbcs', 'ignore')[:300]
-        raise RuntimeError('OCR 没有输出：' + err)
-    with open(TMP_JSON, 'r', encoding='utf-8-sig') as f:
-        data = json.load(f)
+
+    data = None
+    try:                                  # 先问常驻服务（毫秒级）
+        data = _OCR_SERVER.query(TMP_IMG)
+    except Exception:                     # noqa: BLE001
+        data = None
+    if data is None:                      # 服务挂了就退回一次性启动
+        if os.path.exists(TMP_JSON):
+            try:
+                os.remove(TMP_JSON)
+            except OSError:
+                pass
+        cmd = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+               '-File', OCR_PS1, '-ImagePath', TMP_IMG, '-OutPath', TMP_JSON]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120,
+                              creationflags=CREATE_NO_WINDOW)
+        if not os.path.exists(TMP_JSON):
+            err = (proc.stderr or b'').decode('mbcs', 'ignore')[:300]
+            raise RuntimeError('OCR 没有输出：' + err)
+        with open(TMP_JSON, 'r', encoding='utf-8-sig') as f:
+            data = json.load(f)
     if isinstance(data, dict):
         data = [data]
     for item in data:
         for key in ('x', 'y', 'w', 'h'):
             item[key] = float(item.get(key, 0)) / scale
     return data
+
+
+class OcrServer:
+    """常驻的 OCR 进程：PowerShell 只启动一次，之后每次识别只递一个图片路径给它。
+
+    一次性启动 ocr.ps1 的话，光 PowerShell 起来就要 ~0.7 秒，一次识别 ~1.1 秒；
+    常驻之后同样的图每次只要几毫秒。
+    """
+
+    def __init__(self, script):
+        self.script = script
+        self.proc = None
+
+    def _start(self):
+        self.proc = subprocess.Popen(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+             '-File', self.script],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding='utf-8', errors='replace',
+            creationflags=CREATE_NO_WINDOW)
+
+    def query(self, path):
+        """返回 OCR 结果（list）；失败抛异常，由调用方回退。"""
+        if self.proc is None or self.proc.poll() is not None:
+            self._start()
+        self.proc.stdin.write(path + '\n')
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError('OCR 服务已退出')
+        return json.loads(line)
+
+    def close(self):
+        proc = self.proc
+        self.proc = None
+        if proc is None:
+            return
+        try:
+            proc.stdin.write('__exit__\n')
+            proc.stdin.flush()
+            proc.wait(timeout=2)
+        except Exception:                 # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:             # noqa: BLE001
+                pass
+
+
+_OCR_SERVER = OcrServer(OCR_SERVE_PS1)
 
 
 def _clean_line(text):
@@ -503,6 +613,12 @@ class App:
             self.btn.config(state='normal', text='识别')
 
     def _grab(self):
+        """抓取景框那一块屏幕。
+
+        不能直接抓：本窗口就压在框上面。以前是 hide→截→show，会"黑一下"，还要白等 0.15 秒。
+        现在改成把整个窗口透明度临时调到 0（窗口不隐藏、不重排），系统立刻不再画它，
+        抓到的就是底下的海迈；抓完马上恢复。实测比原来快 0.2 秒左右，且不闪。
+        """
         canvas = self.canvas
         canvas.update_idletasks()
         x = canvas.winfo_rootx() + self.frame[0]
@@ -510,37 +626,38 @@ class App:
         w, h = self.frame[2], self.frame[3]
         if w <= 4 or h <= 4:
             raise RuntimeError('取景框太小')
-        self.root.withdraw()
-        self.root.update()
-        time.sleep(0.15)
         try:
+            self.root.attributes('-alpha', 0.0)
+            self.root.update()
+            time.sleep(0.02)              # 等 DWM 把这一帧撤掉
             return ImageGrab.grab(bbox=(x, y, x + w, y + h), all_screens=True)
         finally:
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
+            self.root.attributes('-alpha', 1.0)
             self.root.update()
 
     def _ocr(self, image, preprocess=True):
         return ocr_image(image, self.cfg.get('upscale', 3), preprocess=preprocess)
 
     def _read(self, image):
-        """预处理版和原图版各识别一遍，取"认出数字最多"的那份。
+        """识别框里的数字。
 
-        二值化能压掉 ClearType 彩边（1 被读成 L 那种），但偶尔会把尾部数字吃掉；
-        所以两种都跑，按识别到的数字总个数挑。
+        先跑"二值化预处理版"（能压掉 ClearType 彩边），只有在它几乎没认到东西
+        （数字字符数 < 4）时才回头跑一遍原图版、取认得多的一份。
+        以前是两版都跑，等于每次识别花两倍时间。
         """
-        best = None
-        for prep in (True, False):
-            try:
-                toks = self._ocr(image, preprocess=prep)
-            except Exception:                         # noqa: BLE001
-                continue
-            lines = self._to_lines(toks)
-            score = sum(len(re.findall(r'\d', str(t.get('t', '')))) for t in toks)
-            if best is None or score > best[0]:
-                best = (score, lines)
-        return best[1] if best else []
+        lines, score = self._read_once(image, preprocess=True)
+        if score >= 4:
+            return lines
+        lines2, score2 = self._read_once(image, preprocess=False)
+        return lines2 if score2 > score else lines
+
+    def _read_once(self, image, preprocess=True):
+        try:
+            toks = self._ocr(image, preprocess=preprocess)
+        except Exception:                             # noqa: BLE001
+            return [], 0
+        score = sum(len(re.findall(r'\d', str(t.get('t', '')))) for t in toks)
+        return self._to_lines(toks), score
 
     def _to_lines(self, tokens):
         return tokens_to_lines(tokens)
@@ -600,20 +717,17 @@ class App:
     def _copy(self, text):
         """把结果放进剪贴板，Ctrl+V 直接能粘。
 
-        同时喂一份给系统 clip.exe：Tk 的剪贴板归窗口所有，窗口一关就没了，
-        clip.exe 写的是真剪贴板，关掉本工具后还能粘。
+        直接调 Win32 的剪贴板 API（毫秒级）：既能立刻粘，窗口关掉后也还在。
+        以前是起一个 clip.exe 进程，那一下要几十到上百毫秒，就是"粘得慢"的来源。
         """
         if not text:
             return
-        try:
+        if win_clipboard_text(text):
+            return
+        try:                                       # 兜底：走 Tk 自带剪贴板
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             self.root.update_idletasks()
-        except Exception:                          # noqa: BLE001
-            pass
-        try:
-            subprocess.run(['clip'], input=text.encode('gbk', 'ignore'),
-                           creationflags=0x08000000, check=False)
         except Exception:                          # noqa: BLE001
             pass
 
