@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
 """海迈取数计算器
 
-用法：把窗口拖到计价软件上，把取景框对准要读的数字，点【识别】，按下浮率算出结果，
-      你自己填回软件里。
-
-两种模式：
-  · 主材单价：框住「控制单价」，输出该填的主材单价（定额里只有主材时适用）
-  · 调价    ：框住「控制单价 + 单价下浮」，输出「调整人材机」里该填的定额系数
+用法：把窗口拖到海迈上，把取景框对准"控制单价"那一列的数字，点【识别】，
+      按下浮率算出该填的主材单价，你自己填回海迈。
 
 反推公式（本工程取费口径：取费基数 = 人工 + 材料 + 机械）：
     综合单价 = 主材单价 × (1+管理费) × (1+利润) × (1+税金)
-    目标单价 = 控制单价 × (1 + 下浮率/100)        # 负号=下浮，正号=上浮，与海迈「单价下浮」列一致
-    主材单价 = 目标单价 ÷ K
+    主材单价 = 控制单价 × (1 − 下浮率) ÷ K
     K = 1.0679 × 1.06 × 1.09 = 1.23385166
-调价模式：系数 = (1+目标下浮率/100) ÷ (1+当前下浮率/100)   # 控制价约掉，与取费口径无关
-
-实测回归：控制单价 245.89、下浮 −9.68% → 主材 180.00，反算综合单价 222.09。
+实测回归：控制单价 245.89、下浮 9.68% → 主材 180.00，反算综合单价 222.09（下浮 −9.68%）
 """
 import ctypes
 import json
@@ -602,6 +595,27 @@ class App:
                         lines.append(_fmt(control * (1 + down / 100.0) / k, 2))
         self.txt.delete('1.0', 'end')
         self.txt.insert('1.0', '\n'.join(lines))
+        self._copy('\n'.join(lines))
+
+    def _copy(self, text):
+        """把结果放进剪贴板，Ctrl+V 直接能粘。
+
+        同时喂一份给系统 clip.exe：Tk 的剪贴板归窗口所有，窗口一关就没了，
+        clip.exe 写的是真剪贴板，关掉本工具后还能粘。
+        """
+        if not text:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update_idletasks()
+        except Exception:                          # noqa: BLE001
+            pass
+        try:
+            subprocess.run(['clip'], input=text.encode('gbk', 'ignore'),
+                           creationflags=0x08000000, check=False)
+        except Exception:                          # noqa: BLE001
+            pass
 
     def edit_row(self, event=None):
         if not self.rows:
