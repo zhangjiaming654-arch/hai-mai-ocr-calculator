@@ -12,6 +12,7 @@
 """
 import ctypes
 import itertools
+import random
 import json
 import os
 import re
@@ -50,7 +51,11 @@ DEFAULT_CFG = {
     "geometry": "380x295+1280+110",
     "upscale": 6,
     "mode": "主材单价",
+    "rand_mode": False,
 }
+
+# 随机模式：输出结果对应的下浮率在"设定下浮率 ± 这个值"内浮动（百分点）
+RAND_BAND = 0.25
 
 CREATE_NO_WINDOW = 0x08000000
 # 取景框区域用"抠色透明"：画布底色设成这个关不掉的颜色，再把整窗这个颜色挖成透明，
@@ -491,6 +496,7 @@ class App:
         self.root = root
         self.cfg = cfg
         self.rows = []          # [[控制单价, OCR原文], ...]
+        self.jitter = 0.0
 
         root.title('取数计算器')
         try:
@@ -541,12 +547,19 @@ class App:
                                      width=7, state='readonly')
         self.cbo_mode.pack(side='right', padx=(8, 0))
         self.cbo_mode.bind('<<ComboboxSelected>>', lambda e: self._on_mode())
+        randbar = tk.Frame(root)
+        randbar.grid(row=2, column=0, sticky='ew', padx=8, pady=(0, 4))
+        self.var_rand = tk.BooleanVar(value=bool(cfg.get('rand_mode')))
+        self.chk_rand = tk.Checkbutton(
+            randbar, variable=self.var_rand, command=self._on_rand,
+            text='随机 ±%g%%（输出对应的下浮率在设定值附近浮动）' % RAND_BAND)
+        self.chk_rand.pack(side='left')
         self.entry.bind('<Return>', lambda e: self.recompute())
         self.entry.bind('<FocusOut>', lambda e: self.recompute())
 
         self.txt = tk.Text(root, height=5, bd=1, relief='solid',
                            font=('Consolas', 10), bg='#fbfbfb')
-        self.txt.grid(row=2, column=0, sticky='nsew', padx=6, pady=(0, 6))
+        self.txt.grid(row=3, column=0, sticky='nsew', padx=6, pady=(0, 6))
         self.txt.bind('<Double-Button-1>', self.edit_row)
 
         root.bind('<F8>', lambda e: self.recognize())
@@ -680,6 +693,7 @@ class App:
                                     '框里没识别到数字。\n请把框对准数字那一列，窗口拉大一点再试。')
                 return
             self.rows = rows
+            self._roll_jitter()
             self.recompute()
             self._redraw_frame()
         except Exception as exc:                      # noqa: BLE001
@@ -760,6 +774,21 @@ class App:
                 pass
         save_cfg(self.cfg)
 
+    def _rand_on(self):
+        """随机模式开关（按钮勾上就开）。"""
+        return bool(getattr(self, 'var_rand', None) and self.var_rand.get())
+
+    def _on_rand(self):
+        """点开关：记住设置，重新摇一个偏移，再算一遍。"""
+        self.cfg['rand_mode'] = self._rand_on()
+        save_cfg(self.cfg)
+        self._roll_jitter()
+        self.recompute()
+
+    def _roll_jitter(self):
+        """每识别一次摇一个偏移（百分点），随机模式关掉时是 0。"""
+        self.jitter = random.uniform(-RAND_BAND, RAND_BAND) if self._rand_on() else 0.0
+
     def _down_rate(self):
         """下浮率：符号跟海迈"单价下浮"一致——负数是下浮，正数是上浮。"""
         try:
@@ -768,26 +797,65 @@ class App:
         except ValueError:
             return None
 
+    def _render(self, eff):
+        """按"生效下浮率 eff"算出每行要显示的数 + 它来自哪一行。"""
+        pairs = []
+        if self._mode() == MODES[1]:               # 调价：输出该填的系数
+            # 2 位小数时，系数动 0.01 对应下浮率跳 (1+当前下浮) 个百分点（常是 0.6~0.9），
+            # 根本落不进 ±0.25 的带宽，所以随机模式下给 3 位小数。
+            dec = 3 if self._rand_on() else 2
+            for row in self.rows:
+                coef = price_factor(row[0], row[1], eff)
+                pairs.append(('—' if coef is None else _fmt(coef, dec), row))
+        else:                                      # 主材单价
+            k = k_factor(self.cfg)
+            for row in self.rows:
+                for control in row:
+                    if control > 1.0:
+                        pairs.append((_fmt(control * (1 + eff / 100.0) / k, 2), row))
+        return pairs
+
+    def _implied_down(self, text, row):
+        """由显示出来的数反算它实际对应的下浮率（%），用来校验随机带宽。"""
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return None
+        if self._mode() == MODES[1]:
+            cur = row[1] / 100.0
+            if 1 + cur <= 0:
+                return None
+            return (value * (1 + cur) - 1) * 100.0
+        control = row[0]
+        if control <= 0:
+            return None
+        return (value * k_factor(self.cfg) / control - 1) * 100.0
+
     def recompute(self):
-        """只显示算出来的主材单价（每行一个数）。"""
+        """显示算出来的数（每行一个数）；随机模式下把结果的下浮率圈在 ±0.25 内。"""
         down = self._down_rate()
         if down is None or not self.rows:
             return
         self.cfg['down_rate'] = down
-        k = k_factor(self.cfg)
-        lines = []
-        if self._mode() == MODES[1]:               # 调价：输出该填的系数
-            for row in self.rows:
-                coef = price_factor(row[0], row[1], down)
-                if coef is None:
-                    lines.append('—')
-                else:
-                    lines.append(_fmt(coef, 2))
-        else:                                      # 主材单价
-            for row in self.rows:
-                for control in row:
-                    if control > 1.0:
-                        lines.append(_fmt(control * (1 + down / 100.0) / k, 2))
+        if self._rand_on() and not getattr(self, 'jitter', 0.0):
+            self._roll_jitter()
+        if not self._rand_on():
+            self.jitter = 0.0
+        pairs = self._render(down + getattr(self, 'jitter', 0.0))
+        if self._rand_on():
+            # 小数位截断可能把结果推出带宽，重摇几次挑一个落在带内的
+            for _ in range(40):
+                bad = False
+                for text, row in pairs:
+                    implied = self._implied_down(text, row)
+                    if implied is None or abs(implied - down) > RAND_BAND + 1e-9:
+                        bad = True
+                        break
+                if not bad:
+                    break
+                self.jitter = random.uniform(-RAND_BAND, RAND_BAND)
+                pairs = self._render(down + self.jitter)
+        lines = [text for text, _row in pairs]
         self.txt.delete('1.0', 'end')
         self.txt.insert('1.0', '\n'.join(lines))
         self._copy('\n'.join(lines))
@@ -827,6 +895,7 @@ class App:
         try:
             self.cfg['geometry'] = self.root.geometry()
             self.cfg['mode'] = self._mode()
+            self.cfg['rand_mode'] = self._rand_on()
             self.cfg['frame'] = list(self.frame)
         except Exception:
             pass
