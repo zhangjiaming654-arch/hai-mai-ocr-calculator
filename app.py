@@ -394,7 +394,7 @@ def tokens_to_rows(tokens):
             x0 = y0 = w = h = 0.0
         for m in _NUM_PATTERN.finditer(cleaned):
             value = parse_number(m.group())
-            if value is None or not (0.01 <= abs(value) <= 99999.99):
+            if value is None or not (0.01 <= abs(value) <= 1e9):
                 continue
             start = idx[m.start()]
             end = idx[min(m.end(), len(idx)) - 1] + 1
@@ -421,7 +421,7 @@ def tokens_to_cells(tokens):
             x0 = y0 = w = h = 0.0
         for m in _NUM_PATTERN.finditer(cleaned):
             value = parse_number(m.group())
-            if value is None or not (0.01 <= abs(value) <= 99999.99):
+            if value is None or not (0.01 <= abs(value) <= 1e9):
                 continue
             start = idx[m.start()]
             frac = start / float(max(1, len(text)))
