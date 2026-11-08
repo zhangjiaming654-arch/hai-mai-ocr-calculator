@@ -11,6 +11,7 @@
 实测回归：控制单价 245.89、下浮 9.68% → 主材 180.00，反算综合单价 222.09（下浮 −9.68%）
 """
 import ctypes
+import itertools
 import json
 import os
 import re
@@ -28,6 +29,17 @@ OCR_PS1 = os.path.join(BASE, 'ocr.ps1')
 OCR_SERVE_PS1 = os.path.join(BASE, 'ocr_serve.ps1')
 TMP_DIR = os.environ.get('TEMP') or BASE
 TMP_IMG = os.path.join(TMP_DIR, 'hm_grab.png')
+_TMP_SEQ = itertools.count(1)
+
+
+def _tmp_png_path():
+    """每次换一个临时文件名。
+
+    坑：OCR 服务（WinRT StorageFile）读过某个文件之后，Windows 会让这个路径
+    "不能再被创建"——同一个名字第二次保存必报 `OSError: [Errno 22] Invalid
+    argument`。所以每次都换新名字，用完删掉。
+    """
+    return os.path.join(TMP_DIR, 'hm_grab_%d_%d.png' % (os.getpid(), next(_TMP_SEQ)))
 TMP_JSON = os.path.join(TMP_DIR, 'hm_grab.json')
 
 DEFAULT_CFG = {
@@ -217,28 +229,35 @@ def ocr_image(image, scale=6, preprocess=True):
     scale = _fit_scale(src.width, scale)
     big = src.resize((src.width * scale, src.height * scale), Image.LANCZOS) \
         if scale > 1 else src
-    big.save(TMP_IMG, 'PNG')
+    path = _tmp_png_path()
+    big.save(path, 'PNG')
 
     data = None
-    try:                                  # 先问常驻服务（毫秒级）
-        data = _OCR_SERVER.query(TMP_IMG)
-    except Exception:                     # noqa: BLE001
-        data = None
-    if data is None:                      # 服务挂了就退回一次性启动
-        if os.path.exists(TMP_JSON):
-            try:
-                os.remove(TMP_JSON)
-            except OSError:
-                pass
-        cmd = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-               '-File', OCR_PS1, '-ImagePath', TMP_IMG, '-OutPath', TMP_JSON]
-        proc = subprocess.run(cmd, capture_output=True, timeout=120,
-                              creationflags=CREATE_NO_WINDOW)
-        if not os.path.exists(TMP_JSON):
-            err = (proc.stderr or b'').decode('mbcs', 'ignore')[:300]
-            raise RuntimeError('OCR 没有输出：' + err)
-        with open(TMP_JSON, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
+    try:
+        try:                              # 先问常驻服务（毫秒级）
+            data = _OCR_SERVER.query(path)
+        except Exception:                 # noqa: BLE001
+            data = None
+        if data is None:                  # 服务挂了就退回一次性启动
+            if os.path.exists(TMP_JSON):
+                try:
+                    os.remove(TMP_JSON)
+                except OSError:
+                    pass
+            cmd = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+                   '-File', OCR_PS1, '-ImagePath', path, '-OutPath', TMP_JSON]
+            proc = subprocess.run(cmd, capture_output=True, timeout=120,
+                                  creationflags=CREATE_NO_WINDOW)
+            if not os.path.exists(TMP_JSON):
+                err = (proc.stderr or b'').decode('mbcs', 'ignore')[:300]
+                raise RuntimeError('OCR 没有输出：' + err)
+            with open(TMP_JSON, 'r', encoding='utf-8-sig') as f:
+                data = json.load(f)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     if isinstance(data, dict):
         data = [data]
     for item in data:
@@ -296,15 +315,42 @@ class OcrServer:
 _OCR_SERVER = OcrServer(OCR_SERVE_PS1)
 
 
-def _clean_line(text):
-    """按"行文本"清洗：去空白、负号/小数点归一、全角转半角；返回(清洗串, 原串索引表)。
+_WS = ' \t\u3000\xa0'
+# 这些字符夹在数字中间时，空格属于"数字内部的空格"（如 "1218 . 59"），可以删掉；
+# 其他位置的空格是两个数字之间的分隔（"59 40" 是两格里的两个数），必须留标记。
+_GLUE = set('.,_') | set(_DOTS) | set(_MINUS) | set('-')
 
-    索引表用来把清洗串里的位置换算回原串位置，从而估算数字在行内的横向位置。
+
+def _is_glue(ch):
+    return bool(ch) and (ch in _GLUE)
+
+
+def _clean_line(text):
+    """按"行文本"清洗：负号/小数点归一、全角转半角；返回(清洗串, 原串索引表)。
+
+    空格的处理是这里的关键：以前一律删掉，结果相邻两格的数字会被拼成一个
+    （"1218 ， 59 40" → 1218.594）。现在只有紧挨小数点/逗号的空格才删，
+    其余空格换成分隔符 '|'，避免把两个数粘成一个。
     """
+    raw = str(text)
+    n = len(raw)
     out = []
     idx = []
-    for i, ch in enumerate(str(text)):
-        if ch in ' \t\u3000\xa0':
+    i = 0
+    while i < n:
+        ch = raw[i]
+        if ch in _WS:
+            j = i
+            while j < n and raw[j] in _WS:
+                j += 1
+            prev = out[-1] if out else ''
+            nxt = raw[j] if j < n else ''
+            if _is_glue(prev) or _is_glue(nxt):
+                pass                      # 数字内部/小数点旁的空格，丢掉
+            else:
+                out.append('|')           # 两格之间的空隙，留分隔符
+                idx.append(i)
+            i = j
             continue
         if ch in _MINUS:
             ch = '-'
@@ -314,6 +360,7 @@ def _clean_line(text):
             ch = chr(ord(ch) - 0xff10 + ord('0'))
         out.append(ch)
         idx.append(i)
+        i += 1
     return ''.join(out), idx
 
 
@@ -350,11 +397,8 @@ def tokens_to_rows(tokens):
     return [[value, raw] for _, _, value, raw in items]
 
 
-def tokens_to_lines(tokens):
-    """OCR 行 -> 按"表格行"分组的数值列表：[[982.33, -39.64], ...]。
-
-    同一行的数字 y 相近，按 y 归并；组内按 x 从左到右。
-    """
+def tokens_to_cells(tokens):
+    """OCR 行 -> [(y 中心, x 左端, 数值), ...]，按"先行后列"排序。"""
     items = []
     for tok in tokens:
         text = str(tok.get('t', ''))
@@ -375,11 +419,14 @@ def tokens_to_lines(tokens):
             start = idx[m.start()]
             frac = start / float(max(1, len(text)))
             items.append((y0 + h / 2.0, x0 + frac * w, value))
-    if not items:
-        return []
     items.sort(key=lambda z: (z[0], z[1]))
+    return items
+
+
+def tokens_to_lines(tokens):
+    """OCR 行 -> 按"表格行"分组的数值列表：[[982.33, -39.64], ...]。"""
     lines = []
-    for y, x, value in items:
+    for y, x, value in tokens_to_cells(tokens):
         if lines and abs(y - lines[-1][0]) <= 10:
             lines[-1][1].append((x, value))
         else:
@@ -389,6 +436,34 @@ def tokens_to_lines(tokens):
         cells.sort(key=lambda z: z[0])
         out.append([v for _x, v in cells])
     return out
+
+
+# 拆数是 OCR 自身的毛病（1218.59 会被读成 "121 8.59"/"121 & 59"），换一组预处理
+# 参数往往就能整读出来。所以按顺序试几组，谁认出来的个数正好等于"这个模式应有的
+# 个数"就用谁；主材单价模式只会框 1 个数、调价模式只框 2 个数。
+PREP_VARIANTS = ((True, 120), (True, 140), (True, 160), (True, 100), (False, 0))
+
+
+def pick_numbers(cells, want):
+    """个数不对时的兜底：主材模式只留"最像一个单价"的那个；调价模式留最左两个。"""
+    if want == 1:
+        vals = [c[2] for c in cells]
+        if not vals:
+            return []
+        with_dot = [v for v in vals if abs(v - round(v)) > 1e-9]
+        pool = with_dot or vals
+        return [max(pool, key=lambda v: (len(_fmt(v, 6).rstrip('0')), abs(v)))]
+    rows = []
+    for cell in cells:
+        if rows and abs(cell[0] - rows[-1][0][0]) <= 10:
+            rows[-1].append(cell)
+        else:
+            rows.append([cell])
+    for row in rows:
+        if len(row) >= 2:
+            row = sorted(row, key=lambda z: z[1])
+            return [row[0][2], row[1][2]]
+    return [c[2] for c in cells[:2]]
 
 
 # ---------------------------------------------------------------- 配置
@@ -594,12 +669,12 @@ class App:
         self.root.update_idletasks()
         try:
             image = self._grab()
-            lines = self._read(image)
+            nums = self._read_numbers(image)
             if self._mode() == MODES[1]:
-                # 调价：每行要"控制价 + 单价下浮"两个数（下浮可能是负数，必须留着）
-                rows = [ln for ln in lines if len(ln) >= 2 and ln[0] > 1.0]
+                # 调价：控制价 + 单价下浮（下浮可能是负数，必须留着）
+                rows = [nums] if len(nums) >= 2 and nums[0] > 1.0 else []
             else:
-                rows = [[v] for ln in lines for v in ln if v > 1.0]
+                rows = [[v] for v in nums if v > 1.0]
             if not rows:
                 messagebox.showinfo('没认出数字',
                                     '框里没识别到数字。\n请把框对准数字那一列，窗口拉大一点再试。')
@@ -638,29 +713,32 @@ class App:
     def _ocr(self, image, preprocess=True):
         return ocr_image(image, self.cfg.get('upscale', 3), preprocess=preprocess)
 
-    def _read(self, image):
-        """识别框里的数字。
+    def _want_count(self):
+        """这个模式下框里应该有几个数：主材单价 1 个，调价 2 个（用户明确说的）。"""
+        return 2 if self._mode() == MODES[1] else 1
 
-        先跑"二值化预处理版"（能压掉 ClearType 彩边），只有在它几乎没认到东西
-        （数字字符数 < 4）时才回头跑一遍原图版、取认得多的一份。
-        以前是两版都跑，等于每次识别花两倍时间。
+    def _read_numbers(self, image):
+        """识别框里的数字，用"这个模式应该有几个数"当校验挑最靠谱的一次识别。
+
+        依次换几组预处理（二值化阈值 120/140/160/100 + 原图），哪一组认出来的
+        个数正好等于期望值就直接用；都不对就取最接近的，再按位置/形态兜底修整。
         """
-        lines, score = self._read_once(image, preprocess=True)
-        if score >= 4:
-            return lines
-        lines2, score2 = self._read_once(image, preprocess=False)
-        return lines2 if score2 > score else lines
-
-    def _read_once(self, image, preprocess=True):
-        try:
-            toks = self._ocr(image, preprocess=preprocess)
-        except Exception:                             # noqa: BLE001
-            return [], 0
-        score = sum(len(re.findall(r'\d', str(t.get('t', '')))) for t in toks)
-        return self._to_lines(toks), score
-
-    def _to_lines(self, tokens):
-        return tokens_to_lines(tokens)
+        want = self._want_count()
+        best = []
+        best_gap = None
+        for prep, th in PREP_VARIANTS:
+            try:
+                img = prep_for_ocr(image, th) if prep else image
+                cells = tokens_to_cells(self._ocr(img, preprocess=False))
+            except Exception:                         # noqa: BLE001
+                continue
+            vals = [c[2] for c in cells]
+            gap = abs(len(vals) - want)
+            if best_gap is None or gap < best_gap:
+                best, best_gap = cells, gap
+            if gap == 0:
+                return vals
+        return pick_numbers(best, want)
 
     # -------------------------------------------------- 计算与显示
     def _mode(self):
