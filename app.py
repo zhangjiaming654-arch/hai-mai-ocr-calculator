@@ -53,7 +53,7 @@ DEFAULT_CFG = {
     "geometry": "380x295+1280+110",
     "upscale": 6,
     "mode": "主材单价",
-    "rand_mode": False,
+    "rand_mode": True,
     "decimals": True,
 }
 
@@ -551,18 +551,18 @@ class App:
                                      width=7, state='readonly')
         self.cbo_mode.pack(side='right', padx=(8, 0))
         self.cbo_mode.bind('<<ComboboxSelected>>', lambda e: self._on_mode())
-        randbar = tk.Frame(root)
-        randbar.grid(row=2, column=0, sticky='ew', padx=8, pady=(0, 4))
-        self.var_rand = tk.BooleanVar(value=bool(cfg.get('rand_mode')))
+        self.randbar = tk.Frame(root)
+        self.randbar.grid(row=2, column=0, sticky='ew', padx=8, pady=(0, 4))
+        # 随机数固定开启，「随机数」勾选框已隐藏（保留变量以兼容旧的 config.json）
+        self.var_rand = tk.BooleanVar(value=True)
         self.chk_rand = tk.Checkbutton(
-            randbar, variable=self.var_rand, command=self._on_rand,
+            self.randbar, variable=self.var_rand, command=self._on_rand,
             text='随机数')
-        self.chk_rand.pack(side='left')
         self.var_dec = tk.BooleanVar(value=bool(cfg.get('decimals', True)))
         self.chk_dec = tk.Checkbutton(
-            randbar, variable=self.var_dec, command=self._on_dec,
+            self.randbar, variable=self.var_dec, command=self._on_dec,
             text='小数')
-        self.chk_dec.pack(side='left', padx=(16, 0))
+        self.chk_dec.pack(side='left')
         self.entry.bind('<Return>', lambda e: self.recompute())
         self.entry.bind('<FocusOut>', lambda e: self.recompute())
 
@@ -836,8 +836,8 @@ class App:
         save_cfg(self.cfg)
 
     def _rand_on(self):
-        """随机模式开关（按钮勾上就开）。"""
-        return bool(getattr(self, 'var_rand', None) and self.var_rand.get())
+        """随机数固定开启（勾选框已隐藏），每次识别都在设定下浮率附近浮动。"""
+        return True
 
     def _on_rand(self):
         """点开关：记住设置，重新摇一个偏移，再算一遍。"""
@@ -868,13 +868,22 @@ class App:
         return 2 if self._dec_on() else 0
 
     def _sync_dec_widget(self):
-        """调价模式固定带小数，把「小数」勾选框藏起来；回到主材模式再显示。"""
+        """主材模式显示「小数」勾选框；调价模式固定带小数、把它藏起来。
+
+        整个这一行没有可见控件时（调价模式）整行收起，不留空白。
+        """
         if not getattr(self, 'chk_dec', None):
             return
         if self._mode() == MODES[1]:
             self.chk_dec.pack_forget()
         elif not self.chk_dec.winfo_manager():
-            self.chk_dec.pack(side='left', padx=(16, 0))
+            self.chk_dec.pack(side='left')
+        bar = getattr(self, 'randbar', None)
+        if bar is not None:
+            if self.chk_dec.winfo_manager():
+                bar.grid()
+            else:
+                bar.grid_remove()
 
     def _roll_jitter(self):
         """每识别一次摇一个偏移（百分点），随机模式关掉时是 0。"""
