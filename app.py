@@ -734,9 +734,10 @@ class App:
             self._show_hint('识别失败：%s' % err)
             return
         if self._mode() == MODES[1]:
-            rows = [nums] if len(nums) >= 2 and nums[0] > 1.0 else []
+            # 控制价只要是个正数就行（小额控制价 0.59 也要能算）
+            rows = [nums] if len(nums) >= 2 and nums[0] > 0 else []
         else:
-            rows = [[v] for v in nums if v > 1.0]
+            rows = [[v] for v in nums if v > 0]
         if not rows:
             self._show_hint('没认出数字\n把框对准数字那一列，或把窗口拉大一点再试')
             return
@@ -911,7 +912,7 @@ class App:
             k = k_factor(self.cfg)
             for row in self.rows:
                 for control in row:
-                    if control > 1.0:
+                    if control > 0:
                         dec = self._dec_places()
                         pairs.append((_fmt(control * (1 + eff / 100.0) / k, dec), row))
         return pairs
