@@ -575,6 +575,7 @@ class App:
         root.protocol('WM_DELETE_WINDOW', self.on_close)
 
         self._redraw_frame()
+        self._sync_dec_widget()
 
     # -------------------------------------------------- 取景框
     def _place(self, geometry):
@@ -822,6 +823,7 @@ class App:
         self.cfg['mode'] = self._mode()
         self.rows = []
         self.txt.delete('1.0', 'end')
+        self._sync_dec_widget()
         dw, dh = FRAME_SIZES.get(self._mode(), (80, 48))
         if len(self.frame) == 4:
             self.frame = [self.frame[0], self.frame[1],
@@ -856,10 +858,23 @@ class App:
         self.recompute()
 
     def _dec_places(self):
-        """输出保留几位小数：取消勾选 -> 0 位；调价+随机 -> 3 位；其余 2 位。"""
-        if not self._dec_on():
-            return 0
-        return 3 if (self._mode() == MODES[1] and self._rand_on()) else 2
+        """输出保留几位小数。
+
+        调价模式固定带小数，不受「小数」勾选框影响：随机开启 3 位，否则 2 位；
+        主材模式才看勾选框：勾上 2 位，取消则整数。
+        """
+        if self._mode() == MODES[1]:
+            return 3 if self._rand_on() else 2
+        return 2 if self._dec_on() else 0
+
+    def _sync_dec_widget(self):
+        """调价模式固定带小数，把「小数」勾选框藏起来；回到主材模式再显示。"""
+        if not getattr(self, 'chk_dec', None):
+            return
+        if self._mode() == MODES[1]:
+            self.chk_dec.pack_forget()
+        elif not self.chk_dec.winfo_manager():
+            self.chk_dec.pack(side='left', padx=(16, 0))
 
     def _roll_jitter(self):
         """每识别一次摇一个偏移（百分点），随机模式关掉时是 0。"""
