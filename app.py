@@ -66,10 +66,12 @@ CREATE_NO_WINDOW = 0x08000000
 KEY_COLOR = '#ff00fe'
 FRAME_COLOR = '#2f6fd0'
 FRAME_MIN_W, FRAME_MIN_H = 40, 18
-MODES = ('主材单价', '调价')
+MODES = ('主材单价', '调价', '工料汇总')
 # 每个模式对应的默认取景框大小（切模式时自动换）
-FRAME_SIZES = {'主材单价': (80, 48), '调价': (140, 53)}
+FRAME_SIZES = {'主材单价': (80, 48), '调价': (140, 53), '工料汇总': (80, 48)}
 STIPPLE = 'gray25'
+# 工料汇总模式：把框里读到的数乘这个系数直接输出
+SUMMARY_FACTOR = 0.8
 
 
 # ---------------------------------------------------------------- 计算
@@ -111,7 +113,8 @@ def selftest(cfg):
     ok_sign = up > value          # 上浮算出来的主材要比下浮的大
     back = 180.0 * k_factor(cfg)
     ok_back = abs(back - 222.09) <= 0.01
-    return ok_value and ok_back and ok_sign
+    ok_sum = _fmt(245.89 * SUMMARY_FACTOR, 2) == '196.71'   # 工料汇总：245.89 × 0.8
+    return ok_value and ok_back and ok_sign and ok_sum
 
 
 # ---------------------------------------------------------------- 数字清洗
@@ -482,6 +485,8 @@ def load_cfg():
             cfg.update(json.load(f) or {})
     except Exception:
         pass
+    if cfg.get('mode') not in MODES:          # 旧配置或手改的非法模式，回落到第一个
+        cfg['mode'] = MODES[0]
     return cfg
 
 
@@ -541,14 +546,18 @@ class App:
         bar.grid(row=1, column=0, sticky='ew', padx=6, pady=4)
         self.btn = tk.Button(bar, text='识别', width=6, command=self.recognize)
         self.btn.pack(side='left')
-        tk.Label(bar, text='下浮率').pack(side='left', padx=(10, 2))
+        # 下浮率整块放在一个子框里：工料汇总模式用不到，整块藏起来（不留空位）
+        self.downbox = tk.Frame(bar)
+        self.downbox.pack(side='left')
+        tk.Label(self.downbox, text='下浮率').pack(side='left', padx=(10, 2))
         self.var_down = tk.StringVar(value=_fmt(cfg['down_rate']))
-        self.entry = tk.Entry(bar, textvariable=self.var_down, width=6, justify='right')
+        self.entry = tk.Entry(self.downbox, textvariable=self.var_down, width=6,
+                              justify='right')
         self.entry.pack(side='left')
-        tk.Label(bar, text='%').pack(side='left')
+        tk.Label(self.downbox, text='%').pack(side='left')
         self.var_mode = tk.StringVar(value=cfg.get('mode') or MODES[0])
         self.cbo_mode = ttk.Combobox(bar, textvariable=self.var_mode, values=list(MODES),
-                                     width=7, state='readonly')
+                                     width=9, state='readonly')
         self.cbo_mode.pack(side='right', padx=(8, 0))
         self.cbo_mode.bind('<<ComboboxSelected>>', lambda e: self._on_mode())
         self.randbar = tk.Frame(root)
@@ -576,6 +585,7 @@ class App:
 
         self._redraw_frame()
         self._sync_dec_widget()
+        self._sync_down_widget()
 
     # -------------------------------------------------- 取景框
     def _place(self, geometry):
@@ -825,6 +835,7 @@ class App:
         self.rows = []
         self.txt.delete('1.0', 'end')
         self._sync_dec_widget()
+        self._sync_down_widget()
         dw, dh = FRAME_SIZES.get(self._mode(), (80, 48))
         if len(self.frame) == 4:
             self.frame = [self.frame[0], self.frame[1],
@@ -886,9 +897,31 @@ class App:
             else:
                 bar.grid_remove()
 
+    def _sync_down_widget(self):
+        """工料汇总模式用不到下浮率：把「下浮率 + 输入框 + %」整块藏起来。
+
+        藏的是子框 self.downbox，所以不会在工具条上留一段空位；
+        切回其它模式时放回【识别】按钮右边，用户上次填的值还在。
+        """
+        box = getattr(self, 'downbox', None)
+        if box is None:
+            return
+        if self._mode() == MODES[2]:
+            box.pack_forget()
+        elif not box.winfo_manager():
+            btn = getattr(self, 'btn', None)
+            try:
+                box.pack(side='left', after=btn)
+            except Exception:                      # noqa: BLE001
+                box.pack(side='left')
+
+    def _jitter_on(self):
+        """随机浮动只作用于下浮率；工料汇总模式没有下浮率，输出保持确定。"""
+        return self._rand_on() and self._mode() != MODES[2]
+
     def _roll_jitter(self):
         """每识别一次摇一个偏移（百分点），随机模式关掉时是 0。"""
-        self.jitter = random.uniform(-RAND_BAND, RAND_BAND) if self._rand_on() else 0.0
+        self.jitter = random.uniform(-RAND_BAND, RAND_BAND) if self._jitter_on() else 0.0
 
     def _down_rate(self):
         """下浮率：符号跟海迈"单价下浮"一致——负数是下浮，正数是上浮。"""
@@ -908,6 +941,12 @@ class App:
             for row in self.rows:
                 coef = price_factor(row[0], row[1], eff)
                 pairs.append(('—' if coef is None else _fmt(coef, dec), row))
+        elif self._mode() == MODES[2]:             # 工料汇总：框里的数 × 0.8
+            dec = self._dec_places()
+            for row in self.rows:
+                for value in row:
+                    if value > 0:
+                        pairs.append((_fmt(value * SUMMARY_FACTOR, dec), row))
         else:                                      # 主材单价
             k = k_factor(self.cfg)
             for row in self.rows:
@@ -945,16 +984,20 @@ class App:
 
     def recompute(self):
         """显示算出来的数（每行一个数）；随机模式下把结果的下浮率圈在 ±0.25 内。"""
-        down = self._down_rate()
-        if down is None or not self.rows:
+        if not self.rows:
             return
-        self.cfg['down_rate'] = down
-        if self._rand_on() and not getattr(self, 'jitter', 0.0):
+        down = self._down_rate()
+        summary = self._mode() == MODES[2]         # 工料汇总：只按固定系数算，与下浮率无关
+        if down is None and not summary:
+            return
+        if not summary:
+            self.cfg['down_rate'] = down
+        if self._jitter_on() and not getattr(self, 'jitter', 0.0):
             self._roll_jitter()
-        if not self._rand_on():
+        if not self._jitter_on():
             self.jitter = 0.0
-        pairs = self._render(down + getattr(self, 'jitter', 0.0))
-        if self._rand_on():
+        pairs = self._render((down or 0.0) + getattr(self, 'jitter', 0.0))
+        if self._jitter_on():
             # 小数位截断可能把结果推出带宽，重摇几次挑偏差最小的
             best_dev = self._max_dev(pairs, down)
             for _ in range(40):
@@ -994,7 +1037,9 @@ class App:
         if not (0 <= index < len(self.rows)):
             return
         new_value = simpledialog.askfloat(
-            '改一下', '控制单价：', initialvalue=self.rows[index][0],
+            '改一下',
+            '数值：' if self._mode() == MODES[2] else '控制单价：',
+            initialvalue=self.rows[index][0],
             parent=self.root, minvalue=0.0)
         if new_value is None:
             return
